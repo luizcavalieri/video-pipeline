@@ -18,6 +18,9 @@ Originals are never modified — ingest only reads, and everything written goes 
   mount is lazy on writes: never run a script straight from a file just written to the NAS.
 - The DJI `.LRF` files are 720p proxies; analysis always uses them. Never decode a 4K `.MP4`
   unless there is no proxy.
+- The working copy of the repo is `~/workspace/video-pipeline` (connect it to edit scripts).
+  Edit files there via the Mac shell; never run `git` in the sandbox (it can't delete lock
+  files and leaves the repo wedged). Luiz commits and pushes from his own terminal.
 
 ## Phase 0 — setup (every session)
 1. Confirm the folder is connected (`get_device_info`). If not, ask Luiz to add it.
