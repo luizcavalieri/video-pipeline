@@ -7,86 +7,118 @@ description: Turn a folder of raw travel / off-road / camping footage (DJI Osmo,
 
 Pipeline: **ingest → review → script → (Luiz approves) → assemble → Resolve**.
 Each phase is its own session. State lives in `<folder>/_edit/`, so any phase can resume.
-Originals are never modified — ingest only reads, and everything written goes to `_edit/`.
+Proven end to end on `Turon River Solo Camping - 150826` (2026-09): 69 clips, 172 min → 6:21 cut.
 
-## Hard rules (context budget)
-- Never `cat` `manifest.json`, `review.json` or a sheet into the main session. Query them with
-  `python3 -c` one-liners that print summaries.
-- Only sub-agents look at contact sheets. The main session sees `review.json` (a few KB).
+## Hard rules
+- **Originals are never modified.** Ingest only reads; everything written goes to `_edit/`.
+  The only allowed change to footage is renaming (the `video-content-renamer` skill, run first).
+- **Main media stays on the NAS.** The one sanctioned local video file is the 720p rough cut in
+  `~/workspace/_video_work/<trip>/` — a disposable preview. Never make the timeline depend on
+  local media (no "baking" sped-up shots into local files; tried, rejected).
+- Resolve is the free version: no external scripting. Everything Claude makes must be *importable*.
+- Context budget: never `cat` `manifest.json`, `review.json` or a sheet into the main session;
+  query them with `python3 -c` one-liners. Only sub-agents look at contact sheets.
 - Scripts run on Luiz's Mac (device shell), never in the cloud workspace. Footage never leaves the NAS.
-- Copy the pipeline scripts to the Mac VM's local disk before running (`$HOME/pipeline`). The NAS
-  mount is lazy on writes: never run a script straight from a file just written to the NAS.
-- The DJI `.LRF` files are 720p proxies; analysis always uses them. Never decode a 4K `.MP4`
-  unless there is no proxy.
-- The working copy of the repo is `~/workspace/video-pipeline` (connect it to edit scripts).
-  Edit files there via the Mac shell; never run `git` in the sandbox (it can't delete lock
-  files and leaves the repo wedged). Luiz commits and pushes from his own terminal.
+- Scripts run from the VM's local disk (`$HOME/pipeline`), never straight from a connected folder.
+- The working copy of the repo is `~/workspace/video-pipeline`. Never run `git` in the sandbox
+  (it leaves lock files it can't remove). Luiz commits and pushes from his own terminal.
+
+## Mac sandbox facts
+- Linux VM with ffmpeg, python3, numpy, PIL. 3-min call limit; background processes die when a
+  call ends → every long job runs in resumable bursts (`--budget`).
+- Reads from the NAS are fast; **writes to the NAS ~0.6 MB/s**, to local disk ~35 MB/s.
+- The NAS mount serves stale bytes for a few seconds after a write: `md5sum` before running a
+  freshly written script.
+- **`device_commit_files` caches by staged path.** Committing a changed file under a path it has
+  seen before silently writes the *first* version. Copy to a new staged name (`foo_v2.py`) for
+  every re-commit and verify with `md5sum` on the Mac. Fallback that always works: gzip+base64
+  the file and paste it through `device_bash`.
+- Deleting in a connected folder needs `device_request_delete_permission` once per session.
+  SMB leaves `.smbdelete*` tombstones + empty dirs behind; Luiz bins those in Finder.
 
 ## Phase 0 — setup (every session)
-1. Confirm the folder is connected (`get_device_info`). If not, ask Luiz to add it.
-2. `mkdir -p $HOME/pipeline` on the Mac and put `ingest.py`, `assemble.py` there:
-   `git clone --depth 1 <PIPELINE_REPO_URL> $HOME/pipeline` (GitHub is reachable from the VM).
-   Fallback: gzip+base64 the file through the shell. Never use device_commit_files for scripts
-   (it has landed corrupted files).
-3. `which ffmpeg ffprobe python3` — all three must exist. `python3 -c "import numpy, PIL"`.
-4. Check what already exists: `ls <folder>/_edit/` → decide which phase to resume.
+1. `get_device_info`: both the trip folder and `~/workspace/video-pipeline` must be connected.
+2. `cp -r $HOME/mnt/video-pipeline $HOME/pipeline` (the working copy is ahead of GitHub whenever
+   there are uncommitted edits; `git clone --depth 1 https://github.com/luizcavalieri/video-pipeline.git $HOME/pipeline` is the fallback).
+3. `which ffmpeg ffprobe python3`; `python3 -c "import numpy, PIL"`.
+4. `ls <folder>/_edit/` → decide which phase to resume.
 
 ## Phase 1 — ingest (Mac, in bursts)
-The Mac shell kills background processes when a call ends, so ingest runs in resumable bursts:
 ```
-python3 $HOME/pipeline/ingest.py "<folder>" --workers 4 --budget 140 2>&1 | tail -3
+python3 $HOME/pipeline/scripts/ingest.py "<folder>" --workers 4 --budget 140 2>&1 | tail -3
 ```
-Repeat the call until it prints `ALL DONE` (≈ 1 burst per 40 min of footage; the last bursts
-finish the longest clips — drop `--budget` to 90 if a call times out). Work is saved per
-2-minute segment under `_edit/parts/`, so a killed call loses at most a few seconds.
-Output: `_edit/manifest.json` (~3 KB/clip), `_edit/sheets/*.jpg` (~170 KB each).
-Sanity check: `error` entries, `motion` length ≈ duration, clips with no `index_desc`.
-Reading the profiles: motion pegged at 9 for a whole clip = handheld shake, not action.
+Repeat until `ALL DONE` (≈ 1 burst per 40 min of footage; drop `--budget` to 90 if a call times
+out). Progress is saved per 2-min segment under `_edit/parts/`; delete `parts/` once done.
+Output: `_edit/manifest.json` (~3 KB/clip), `_edit/sheets/*.jpg` (~170 KB each, timecoded tiles).
+Uses the DJI `.LRF` 720p proxies; never decodes a 4K `.MP4` unless there is no proxy.
+Sanity: `error` entries, `motion` length ≈ duration, clips with no `index_desc`.
+Motion pegged at 9 for a whole clip = handheld shake, not action.
 
-## Phase 2 — review (cloud, parallel sub-agents)
-1. Stage all sheets to the cloud: `device_stage_files` (≤50 per call).
-2. Build batches of ~8 clips. For each batch produce a compact text block from the manifest:
-   `id, duration, index_desc, motion (as a string of digits), scenes, tile times`.
-3. Launch one `Agent` per batch **in a single message** (concurrent). Each agent gets
-   `review_prompt.md` + its batch text + the staged sheet paths to `Read`. It returns a JSON array.
-4. Merge into `_edit/review.json` (write via the Mac shell, then confirm size with `wc -c`).
+## Phase 2 — review (cloud, parallel sub-agents) — the step that finds the interesting bits
+1. `device_stage_files` all sheets to the cloud (≤50 per call).
+2. Batches of ~8 clips. For each, a compact text block from the manifest:
+   `id, duration, index_desc, motion (digit string), scenes, tile times`.
+3. One `Agent` per batch **in a single message** (concurrent, ~1 min wall time). Each gets
+   `prompts/review_prompt.md` + its batch text + the staged sheet paths to `Read`. Returns a JSON array.
+4. Merge into `_edit/review.json` (write via the Mac shell, confirm with `wc -c`).
 5. Print a one-screen summary: count by role, the `interest ≥ 4` moments with timecodes.
+On Turon this found the real beats unprompted (rain→sun pivot, "SHUT THE GATE MATE" sign, the
+cow stare, three escalating water crossings, odometer 20,000 km, Mount Panorama finale).
 
 ## Phase 3 — script (main session, small input)
-Inputs: `review.json` summary + `index.md` day narrative + any brief from Luiz (target length,
-song, tone). Write `_edit/script.md` with:
-- **Concept** (3 lines): the arc, the hook in the first 5 s, the ending beat, tone (funny beats
-  come from contrast — e.g. sheep/cow stares, the odometer rollover, rain → sun).
-- **Shot list table**: `# | clip id | in | out | speed | duration on timeline | note`.
-  Target 4–7 min. Driving connectors at 2–4×, never longer than 8 s on the timeline.
-  Moments at 1×. Camp/cooking as breathing room between driving blocks.
-- **Music**: if Luiz supplied a song, mark beat/section cue points where blocks should change.
-  Otherwise suggest genre / BPM / mood for him to pick.
-- **Titles/captions**: 3–6 short overlays max (place names, day markers, one-liners).
-- A fenced ```json shotlist``` block mirroring the table — this is what `assemble.py` reads.
-Send the script to Luiz (SendUserMessage) and STOP. He edits or approves.
+Inputs: `review.json` summary + `index.md` day narrative + Luiz's brief (target length, song, tone).
+Write `_edit/script.md`:
+- **Concept** (3 lines): arc, hook in the first 5 s, ending beat, tone. Funny beats come from
+  contrast (animal stares, signs, the odometer, weather turning).
+- **Shot list table**: `# | clip id | in | out | speed | timeline duration | note`. Target 4–7 min
+  (Turon: scripted 6:21, final 7:22 — the song set the length). Driving connectors at 2–4×, ≤ 8 s
+  on the timeline. Moments at 1×, 6–10 s; the set pieces (water crossings, the finale) earn 10–15 s.
+  Camp/cooking as breathing room between driving blocks. Time-lapses (cooking, setup) at 8–16×.
+- **Out-points must be inside the clip** — check `out ≤ duration` from the manifest. (`assemble.py`
+  clamps and warns, but fix the script.)
+- **Music**: if a song was given, cut to its length and mark the beat/section cue points where
+  blocks change. Otherwise suggest genre / BPM / mood for Luiz to pick and expect him to stretch
+  the cut to fit the song later.
+- **Titles/captions**: 6–10 short overlays — opening title over the hook, place names as they
+  appear (towns, valleys, roads), day markers ("NEXT MORNING"), one-liners on the gags ("JUST
+  SEND IT", "MY NEXT CAMPING SITE"), a graphic for a number moment (odometer), and a closing
+  title card after the cut to black. Put each in the shot's `note`. Mark pieces-to-camera as
+  "CHECK AUDIO" — on Turon both earned their place.
+- Name the two shots to drop first if the cut runs long.
+- A fenced ```json shotlist``` block mirroring the table — what `assemble.py` reads.
+Send the script (SendUserMessage) and STOP. Luiz edits or approves.
 
-## Phase 4 — assemble (Mac, after approval)
+## Phase 4 — assemble (Mac, in bursts, after approval)
 ```
-python3 $HOME/pipeline/assemble.py "<folder>" --script _edit/script.md [--music song.mp3]
+python3 $HOME/pipeline/scripts/assemble.py "<folder>" \
+  --media-root "/Volumes/Videos/travels/<trip folder name>" \
+  --work-dir "$HOME/mnt/workspace/_video_work/<trip folder name>" --budget 100 2>&1 | tail -4
 ```
-Produces in `_edit/out/`:
-- `roughcut_720p.mp4` — the whole cut from the LRF proxies, speed changes applied, music if
-  given. Luiz watches this before opening Resolve. Built first; it's cheap.
-- `timeline.fcpxml` — ordered clips with in/out points referencing the 4K originals, with
-  retime attributes. Free Resolve imports these inconsistently, so `script.md` also lists every
-  speed change as a table he can apply by hand (Change Clip Speed) if they don't come across.
-- `connectors/*.mp4` — optional `--bake`: sped-up connectors rendered from the 4K originals so
-  the timeline needs no retime at all. 4K HEVC decode in the Mac VM is slow with no GPU, so
-  this runs in the same burst/resume pattern as ingest and can take a while.
-Send the rough cut path and a 3-line "what to check" note.
+Repeat until `ALL DONE` (≈ 15 shots per burst). Produces:
+- `<work-dir>/roughcut_720p.mp4` — the cut from proxies, speeds applied; `--music song` mixes a
+  track. Luiz watches this to judge the cut and audition music. Disposable.
+- `_edit/timeline.fcpxml` — 4K originals, in/out per shot, **every shot at 1×** (see Phase 5).
+- `_edit/speeds.md` — the speed changes to apply by hand, ordered end-of-timeline first.
+`--timeline-only` rewrites just the last two (seconds) after a script tweak.
+Sanity: rough-cut `ffprobe` duration = script total; contact-sheet the rough cut (`fps=1/8,
+tile=8x6`) and look before handing over.
 
-## Phase 5 — Resolve (Luiz)
-File → Import → Timeline → `timeline.fcpxml`. Media is relinked by path (NAS paths must match).
-Colour, transitions, titles, audio ducking are done by hand. If a title list was scripted,
-paste it from `script.md`.
+## Phase 5 — Resolve (Luiz, ~15 min)
+1. File → Import → Timeline → `_edit/timeline.fcpxml`. In the media folder picker type
+   `/Volumes/Videos` into the **Path Name** box (the picker only lists configured locations).
+   All clips link because assets carry the DJI time-of-day start timecode.
+2. Sequence reads the 1× length (Turon: 11:09). Apply the speeds from `speeds.md` top to bottom:
+   playhead at the position → right-click the clip → Change Clip Speed → % → **Ripple Sequence**.
+   Sequence then reads the script length (Turon: 6:21).
+3. Music, titles, colour, ducking by hand.
 
-## Files in the pipeline repo
-- `ingest.py` — analysis → manifest + sheets (done, tested on Turon River 2026-08).
-- `review_prompt.md` — sub-agent instructions (done).
-- `assemble.py` — shotlist → FCPXML + baked connectors + rough cut (Phase 4; build on first use).
+Why it is done this way (don't re-litigate): Resolve imports FCPXML `<timeMap>` speed ramps as
+freeze frames (absolute and clip-relative both tried); it ignores FCPXML clip names and notes;
+its scripting API has no speed setter (and external scripting is Studio-only anyway); baking
+sped shots to local files works but breaks the "media stays on the NAS" rule.
+
+## Files
+- Repo: `scripts/ingest.py`, `scripts/assemble.py`, `prompts/review_prompt.md`, this skill, `README.md`.
+- `<trip>/_edit/`: `manifest.json`, `sheets/`, `batches/`, `review.json`, `script.md`,
+  `timeline.fcpxml`, `speeds.md`. (`parts/` only while ingest is running.)
+- Local, disposable: `~/workspace/_video_work/<trip>/segs/`, `roughcut_720p.mp4`.
