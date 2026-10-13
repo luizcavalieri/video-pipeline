@@ -7,17 +7,26 @@ assemble.py — turn the approved shot list in _edit/script.md into
   _edit/speeds.md                (the speed changes to apply by hand in Resolve, end-of-timeline first)
 
 Usage:
-    python3 assemble.py "<footage folder>" --media-root "/Volumes/.../<folder>" \
-        --work-dir "<fast local dir>" [--script _edit/script.md] [--music song.mp3] \
+    python3 assemble.py "<footage folder>" [--media-root "<folder path as Resolve sees it>"] \
+        [--work-dir "<fast local dir>"] [--script _edit/script.md] [--music song.mp3] \
         [--workers 4] [--budget 150] [--timeline-only] [--force]
 
-Runs in resumable bursts like ingest.py: each shot is rendered to <work-dir>/segs/NNN.mp4;
+Runs in resumable bursts like ingest.py: each shot is rendered to <work-dir>/segs/<key>.mp4,
+where <key> hashes clip/in/out/speed/render settings, so renumbering or editing shots never
+reuses stale footage and unchanged shots are never re-rendered;
 re-run until it prints "ALL DONE". --work-dir must be a fast local disk (writes to the NAS
 through the desktop bridge run at well under 1 MB/s); only the small FCPXML and speeds.md go
 to <folder>/_edit/. --timeline-only skips the rendering and just (re)writes those two.
 
---media-root is the folder's path *as Resolve will see it on the Mac* (the sandbox mounts
-it elsewhere). It is only used inside the FCPXML.
+--media-root is the folder's path *as Resolve will see it* (a sandbox or remote mount may differ).
+It defaults to the footage folder itself, which is right whenever this shell and Resolve see the
+same path. It is only used inside the FCPXML.
+
+--work-dir defaults to $VIDEO_WORK_DIR/<footage folder name> when that environment variable is set.
+
+The rough cut is also copied to <footage folder>/_edit/roughcut_720p.mp4 so the user can watch it
+(--work-dir is often invisible to them). The copy is chunked and resumable, so on slow storage it
+may take a few bursts: keep re-running until "ALL DONE". --no-publish skips it.
 
 Resolve (free) and the FCPXML: two things must be right for the 4K originals to link —
 assets carry the file's embedded start timecode (DJI writes time-of-day), and the volume
@@ -32,12 +41,13 @@ The shot list is the ```json shotlist``` block in script.md: a list of
 {n, clip, in, out, speed, note}. `clip` is the file stem; the original is <clip>.MP4/.MOV/...
 and the proxy, if any, is <clip>.LRF.
 """
-import argparse, json, re, subprocess, time, html
+import argparse, hashlib, json, os, re, subprocess, time, html
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
 VIDEO_EXT = [".MP4", ".mp4", ".MOV", ".mov", ".mkv", ".m4v"]
 FPS = 25
+RENDER_VERSION = 1        # bump when render_segment's filters/encode settings change
 W, H = 1280, 720
 
 
@@ -231,28 +241,73 @@ def write_fcpxml(shots, originals, media_root, out, name, retime=False):
     return t
 
 
+PUBLISH_CHUNK = 4 << 20
+
+
+def publish_roughcut(rc, dest, t_end):
+    """Copy the rough cut next to the footage (default <folder>/_edit/) so the user can open it.
+    The work dir is usually somewhere the user can't see, and the destination (NAS, bridge) can be
+    slow, so the copy is chunked and resumable: it stops at t_end, and a re-run continues from the
+    partial file. A .sig file ties the partial/finished copy to the exact rough cut it came from.
+    Returns True when dest is complete."""
+    sig = f"{rc.stat().st_size}:{rc.stat().st_mtime_ns}"
+    sigf = dest.with_name(dest.name + ".sig")
+    part = dest.with_name(dest.name + ".part")
+    sig_txt = sigf.read_text().strip() if sigf.exists() else ""
+    if dest.exists() and sig_txt == sig + ":done":
+        return True
+    if not (part.exists() and sig_txt == sig):             # new/changed cut, or nothing started yet
+        part.write_bytes(b"")
+        sigf.write_text(sig + "\n")
+    size = rc.stat().st_size
+    pos = part.stat().st_size
+    if pos > size:
+        part.write_bytes(b""); pos = 0
+    with open(rc, "rb") as r, open(part, "ab") as w:
+        r.seek(pos)
+        while pos < size and time.time() < t_end:
+            chunk = r.read(PUBLISH_CHUNK)
+            w.write(chunk); w.flush()
+            pos += len(chunk)
+    if pos >= size:
+        os.replace(part, dest)
+        sigf.write_text(sig + ":done\n")
+        return True
+    print(f"  publishing rough cut: {pos/1e6:.0f} / {size/1e6:.0f} MB", flush=True)
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder")
-    ap.add_argument("--media-root", required=True, help="folder path as seen by Resolve on the Mac")
+    ap.add_argument("--media-root", default=None,
+                    help="folder path as seen by Resolve (default: the footage folder itself)")
     ap.add_argument("--script", default="_edit/script.md")
     ap.add_argument("--music", default=None)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--budget", type=float, default=150)
     ap.add_argument("--work-dir", default=None,
-                    help="where segments + rough cut are written: a fast local disk, e.g. ~/workspace/_video_work/<trip>")
+                    help="where segments + rough cut are written: a fast local disk, e.g. ~/video_work/<trip> "
+                         "(default: $VIDEO_WORK_DIR/<footage folder name> if that env var is set)")
     ap.add_argument("--retime", action="store_true",
                     help="FCPXML: express speed changes as <timeMap> (not for Resolve — it imports them as "
                          "freeze frames). Default: shots at 1x + speeds.md to apply by hand.")
     ap.add_argument("--timeline-only", action="store_true",
                     help="skip segments/rough cut; only (re)write _edit/timeline.fcpxml + speeds.md")
+    ap.add_argument("--no-publish", action="store_true",
+                    help="don't copy the rough cut into <folder>/_edit/ (it stays in --work-dir only)")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
     t0 = time.time()
 
     folder = Path(a.folder).resolve()
+    if not a.media_root:
+        a.media_root = str(folder)
+    if not a.work_dir and os.environ.get("VIDEO_WORK_DIR"):
+        a.work_dir = str(Path(os.environ["VIDEO_WORK_DIR"]).expanduser() / folder.name)
     if not a.timeline_only and not a.work_dir:
-        ap.error("--work-dir is required for rendering (a fast local disk, never the NAS)")
+        ap.error("--work-dir is required for rendering (a fast local disk, never the NAS); "
+                 "or set VIDEO_WORK_DIR")
     out = Path(a.work_dir).resolve() if a.work_dir else None
     segs = out / "segs" if out else None
     if segs:
@@ -294,9 +349,15 @@ def main():
             return False
         return abs(d - s["dur"]) < 0.5
 
+    def seg_path(s):
+        """content-addressed: the file name changes whenever anything that affects the pixels does"""
+        k = json.dumps([s["clip"], round(s["in"], 3), round(s["out"], 3), round(s["speed"], 4),
+                        W, H, FPS, RENDER_VERSION])
+        return segs / f"{hashlib.sha1(k.encode()).hexdigest()[:16]}.mp4"
+
     todo = []
     for s in shots:
-        seg = segs / f"{s['n']:03d}.mp4"
+        seg = seg_path(s)
         if a.force or not seg_ok(seg, s):
             todo.append((s, seg))
     print(f"{len(todo)} segments to render, budget {a.budget}s", flush=True)
@@ -324,17 +385,29 @@ def main():
                     errs += 1
                     print(f"  ERR #{s['n']} {s['clip']}: {e}", flush=True)
 
-    missing = [s for s in shots if not seg_ok(segs / f"{s['n']:03d}.mp4", s)]
+    missing = [s for s in shots if not seg_ok(seg_path(s), s)]
     print(f"{done_n} rendered in {time.time()-t0:.0f}s, {errs} errors, {len(missing)} segments missing")
     if missing:
         print("RUN AGAIN"); return
 
     rc = out / "roughcut_720p.mp4"
-    if a.force or not rc.exists():
-        concat([segs / f"{s['n']:03d}.mp4" for s in shots], rc, a.music)
+    seg_list = [seg_path(s) for s in shots]
+    # rebuild the cut whenever the shot list or the music changed, not only when it's missing
+    key = hashlib.sha1(json.dumps([p.name for p in seg_list] + [str(a.music or "")]).encode()).hexdigest()
+    key_file = out / "roughcut.key"
+    if a.force or not rc.exists() or not key_file.exists() or key_file.read_text().strip() != key:
+        concat(seg_list, rc, a.music)
+        key_file.write_text(key + "\n")
 
     print(f"rough cut → {rc} ({rc.stat().st_size/1e6:.0f} MB)")
     write_timeline()
+    if not a.no_publish:
+        dest = folder / "_edit" / "roughcut_720p.mp4"
+        if out.resolve() != dest.parent.resolve():
+            # spend what is left of the budget copying; always allow a little progress per burst
+            if not publish_roughcut(rc, dest, max(t0 + a.budget, time.time() + 20)):
+                print("RUN AGAIN"); return
+            print(f"rough cut for review → {dest}")
     print("ALL DONE")
 
 

@@ -54,13 +54,33 @@ def ffprobe(path):
 
 
 def parse_index(folder):
+    """clip stem -> description from index.md. Reads both layouts the renamer has written:
+    table rows  | day | time | `stem` | desc |   and   ### stem.MP4 / *meta* / paragraph(s)."""
     p = folder / "index.md"
     out = {}
-    if p.exists():
-        for line in p.read_text(errors="ignore").splitlines():
-            m = re.match(r"^\|\s*[^|]*\|\s*[^|]*\|\s*`([^`]+)`\s*\|\s*(.+?)\s*\|\s*$", line)
-            if m:
-                out[m.group(1)] = m.group(2)
+    if not p.exists():
+        return out
+    cur, buf = None, []
+
+    def flush():
+        if cur and buf:
+            out[cur] = " ".join(buf)
+
+    for line in p.read_text(errors="ignore").splitlines():
+        m = re.match(r"^\|\s*[^|]*\|\s*[^|]*\|\s*`([^`]+)`\s*\|\s*(.+?)\s*\|\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+            continue
+        h = re.match(r"^#{2,4}\s+(.+?)\s*$", line)
+        if h:
+            flush()
+            name = h.group(1).strip("` ")
+            cur, buf = (Path(name).stem if re.search(r"\.(mp4|mov|lrf|mts|mkv)$", name, re.I) else None), []
+            continue
+        t = line.strip()
+        if cur and t and not (t.startswith("*") and t.endswith("*")):
+            buf.append(t)
+    flush()
     return out
 
 
