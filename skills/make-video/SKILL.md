@@ -14,8 +14,9 @@ Proven end to end on a 2-day solo 4WD camping trip: 69 clips, 172 min → 6:21 c
   iPhone/other clips work but have no proxy and no meaningful timecode (slower ingest, weaker linking).
 - Timeline grid is **25 fps, 3840x2160** (`FPS` in `assemble.py`). Other frame rates import but
   the sequence itself is 25p.
-- DaVinci Resolve **free**. The `.fcpxml` import path is the only integration.
-- ffmpeg/ffprobe and Python 3 with numpy + Pillow on the machine that can see the footage.
+- DaVinci Resolve **free**, tested with version 21. The `.fcpxml` import path is the only integration.
+- ffmpeg/ffprobe (with libx264 + AAC) and Python 3.10+ with numpy on the machine that can see the footage.
+- The `video-content-renamer` skill (bundled in `skills/`) installed alongside this one.
 
 ## Hard rules
 - **Originals are never modified.** Ingest only reads; everything written goes to `_edit/`.
@@ -35,10 +36,11 @@ Proven end to end on a 2-day solo 4WD camping trip: 69 clips, 172 min → 6:21 c
    - the same folder as **Resolve** sees it (`--media-root`; defaults to the first, so only pass it
     when they differ, e.g. a mounted volume).
 2. **Names check.** `ls <folder>` — if clips still carry camera names (`DJI_…`, `IMG_…`, `GX…`,
-   `VID_…`, `C00…`) or there is no `index.md`, run the `video-content-renamer` skill on the
-   folder first (if you don't have it, write a short `index.md` by hand, see README). Ingest keys
+   `VID_…`, `C00…`) or there is no `index.md`, run the bundled `video-content-renamer` skill on the
+   folder first (it asks the user to approve names before touching anything; if it isn't installed, write
+   a short `index.md` by hand, see README). Ingest keys
    everything on the clip stem and Phase 3 reads `index.md`.
-3. `which ffmpeg ffprobe python3`; `python3 -c "import numpy, PIL"` (`pip install -r requirements.txt`).
+3. `which ffmpeg ffprobe python3`; `python3 -c "import numpy"` (`pip install -r requirements.txt`).
 4. `ls <folder>/_edit/` → decide which phase to resume.
 Below, `$PIPELINE` is wherever this repo is checked out (README: set `PIPELINE` and `VIDEO_WORK_DIR` once).
 

@@ -6,6 +6,9 @@ DaVinci Resolve (free) timeline, driven by Claude with the `make-video` skill.
 Phases: **ingest → review → script → (approve) → assemble → Resolve**. State lives in
 `<footage folder>/_edit/`; originals are never modified and the media never moves.
 
+**It is tuned for travel / off-road / camping footage.** See "Made for travel footage" below for what to
+edit if yours is different.
+
 Proven on a 2-day 4WD trip: 69 clips / 172 min → 64-shot, 6:21 cut, imported into Resolve with
 all clips linked; ~15 min of hand work in Resolve (apply 27 speed changes from `speeds.md`).
 
@@ -14,21 +17,29 @@ all clips linked; ~15 min of hand work in Resolve (apply 27 speed changes from `
 **Claude Code** (recommended):
 ```
 git clone <this repo> ~/video-pipeline
-mkdir -p ~/.claude/skills && cp -r ~/video-pipeline/skills/make-video ~/.claude/skills/
+mkdir -p ~/.claude/skills && cp -r ~/video-pipeline/skills/make-video ~/video-pipeline/skills/video-content-renamer ~/.claude/skills/
 pip install -r ~/video-pipeline/requirements.txt
 ```
 Then tell Claude where the repo lives (the skill refers to it as `$PIPELINE`), e.g. "the pipeline is in
 ~/video-pipeline", and point it at a footage folder: "make a video from ~/footage/my-trip".
 
-**claude.ai**: zip the `skills/make-video` folder and upload it under Settings → Capabilities → Skills.
+**claude.ai**: zip each of `skills/make-video` and `skills/video-content-renamer` and upload both under
+Settings → Capabilities → Skills.
 The scripts need a shell with ffmpeg, so this only works if your session can run commands on the
 machine that holds the footage.
 
 ## Requirements
 - ffmpeg / ffprobe on PATH
-- Python 3 with numpy + Pillow (`pip install -r requirements.txt`)
-- DaVinci Resolve (free is fine)
-- Optional: the `video-content-renamer` skill, to give camera-named clips meaningful names
+- Python 3.10+ with numpy (`pip install -r requirements.txt`). Tested on 3.10.
+- ffmpeg built with libx264 and AAC (the default Homebrew/apt builds). Tested on 4.4.2.
+- DaVinci Resolve (free is fine). Tested with **Resolve 21**; other versions are untested, and the
+  FCPXML import behaviour described under "Dead ends" may differ.
+- The `video-content-renamer` skill (included in `skills/`): `make-video` runs it first when clips still
+  have camera names or there is no `index.md`. It renames your footage after you approve a list, and
+  writes the `index.md` that the pipeline reads. Skip it only if your clips are already well named and
+  you have written `index.md` by hand (format below).
+- An agent that can run **parallel sub-agents** (Claude Code's Agent tool) for the review phase. Without
+  one, review runs sequentially and is much slower.
 
 ## Assumptions (read before using your own footage)
 - **DJI-style clips**: `.MP4` with an embedded time-of-day start timecode. Resolve links the
@@ -47,6 +58,28 @@ machine that holds the footage.
 - **Slow media**: if footage is on a NAS, writes there can be very slow. That is why the cut and
   work files go to `--work-dir` on a local disk and `_edit/` stays small (sheets are ~170 KB each).
 
+## Made for travel footage: what to change for yours
+This pipeline was built and tuned for one kind of video: a 4-7 minute social cut of **travel, off-road and
+camping trips** (driving, water crossings, camp life, scenery, the odd animal or sign), shot on a DJI
+Osmo and an iPhone. Its idea of "interesting" is baked into prompts and rules, not code. If your footage
+is something else (a wedding, a sports day, a city break), edit these:
+
+| Where | What is travel-specific | How to adapt |
+|---|---|---|
+| `prompts/review_prompt.md` | The **tags** (`driving`, `offroad`, `water_crossing`, `obstacle`, `camp`, `cooking`, `wildlife`, `sign`, `night`, ...), the **moment candidates** (water crossings, gates, steep bits, odometer rollovers, sign reveals), the "connector" idea (driving that only links two places, speed 3-4x), and the calibration line ("a 7-minute video uses ~40 shots from ~70 clips") | Rewrite the tag list and the candidate list for your subject, e.g. `speech`, `crowd`, `goal`, `food`, `toast`. **No script reads the tags or roles**; only Claude does, so change or extend them freely. Keep the JSON shape (`id`, `interest`, `role`, `moments[in,out,speed]`, `note`), because the later phases summarise those fields. |
+| `skills/make-video/SKILL.md`, Phase 3 | The **pacing rules** (4-7 min target; driving connectors 2-4x and at most 8 s; moments 6-10 s; set pieces 10-15 s; time-lapses 8-16x), the **title/caption** advice (place names, day markers, one-liners on gags), and "funny beats come from contrast" | Replace with your own edit style: target length, how long a shot may stay on screen, which speeds are normal, what captions you want. |
+| `skills/make-video/SKILL.md`, frontmatter | The `description` says "travel / off-road / camping footage" and decides **when the skill triggers** | Reword it to match your footage, or Claude may not pick the skill up. |
+| `skills/make-video/SKILL.md`, Phase 1-2 | "Motion pegged at 9 for a whole clip = handheld shake, not action" assumes vehicle-mounted or walking footage | Adjust the hint if your camera work is different (tripod, gimbal, drone). |
+| `scripts/ingest.py` constants | `MOTION_HI` (what counts as fast; tuned so driving reads ~9), `SCENE_SPIKE` (frame difference that counts as a cut), `SEG` (seconds per job), `SHEET_COLS`/`SHEET_MAX_TILES`/`TILE_W` (contact-sheet size), `MIN_DURATION` | Tune if the motion profile is flat or maxed out on your footage (e.g. sports needs a higher `MOTION_HI`). |
+| `scripts/ingest.py` `LOCAL_TZ_OFFSET_H` | Hardcoded to **+10** (Sydney standard time) for the `created` timestamp. It ignores daylight saving. | Set your own offset. It only affects the `created` field, not the cut. |
+| `scripts/assemble.py` constants | `FPS = 25`, the 3840x2160 sequence, the 1280x720 rough cut (`W, H`), the x264 settings, `VIDEO_EXT` | See Assumptions above; change for 24/30 fps work or other resolutions. |
+| `skills/video-content-renamer/SKILL.md` | Names are `dayN_<what it shows>` with days counted as the Nth calendar date that has footage. That suits multi-day trips. | For a single-day event or a non-trip project, change the naming scheme (e.g. `ceremony_`, `reception_`). `ingest.py` only needs a stable clip stem and, optionally, the `index.md` descriptions. |
+
+Not in the table but worth knowing: the phases hand work to each other only through files (`index.md` and
+`manifest.json` into review, `review.json` into scripting, `script.md` into assemble), so you can swap the
+logic behind a phase (a different reviewer prompt, a different scripting style) as long as it still
+produces the same file.
+
 ## Layout
 - `scripts/ingest.py`: analyses every clip → `_edit/manifest.json` + timecoded contact sheets.
   Resumable, time-budgeted bursts.
@@ -55,6 +88,8 @@ machine that holds the footage.
 - `scripts/assemble.py`: approved shot list (`_edit/script.md`) → 720p rough cut (local,
   disposable), `_edit/timeline.fcpxml` (4K originals, every shot at 1×) and `_edit/speeds.md`.
 - `skills/make-video/SKILL.md`: the Claude skill that orchestrates the phases.
+- `skills/video-content-renamer/SKILL.md`: renames clips by content and writes `index.md`. Written for
+  Cowork; has a preface for plain Claude Code, but that path is untested (macOS needs GNU `stat`/`date`).
 - `docs/cowork-sandbox-notes.md`: optional; only if Claude runs from a cloud sandbox linked to your
   computer (call limits, file-commit caching bug, NAS quirks).
 

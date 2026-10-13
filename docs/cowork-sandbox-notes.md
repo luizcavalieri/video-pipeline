@@ -16,7 +16,7 @@ way while building the pipeline; the generic `SKILL.md` assumes none of it.
   work dir (e.g. `~/workspace/_video_work/<trip>/`), a disposable preview.
 
 ## Sandbox facts
-- Linux VM with ffmpeg, python3, numpy, PIL. **3-minute call limit**; background processes die when
+- Linux VM with ffmpeg, python3, numpy. **3-minute call limit**; background processes die when
   a call ends, so every long job runs in resumable bursts (`--budget`).
 - Reads from the NAS are fast; **writes to the NAS ~0.6 MB/s**, to local disk ~35 MB/s.
 - The NAS mount serves stale bytes for a few seconds after a write: `md5sum` before running a
